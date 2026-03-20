@@ -1,0 +1,16 @@
+node_modules/
+.local/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+build/
+dist/
+dist-electron/
+resources/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example

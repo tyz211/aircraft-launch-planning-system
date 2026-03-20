@@ -1,0 +1,5 @@
+{
+  "name": "Aircraft Launch Planning System",
+  "description": "A web-based aircraft launch planning and scheduling system using Genetic Algorithms.",
+  "requestFramePermissions": []
+}
