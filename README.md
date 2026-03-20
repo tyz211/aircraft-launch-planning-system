@@ -86,47 +86,7 @@ npm run lint
 curl http://127.0.0.1:15050/api/health
 ```
 
-## Git 与 GitHub 使用建议
 
-应该提交到 Git 的内容：
-
-- `src/`
-- `electron/`
-- `python_backend/`
-- `package.json`
-- `package-lock.json`
-- `tsconfig.json`
-- `vite.config.ts`
-- `index.html`
-- `README.md`
-- `.gitignore`
-
-不要提交到 Git 的内容：
-
-- `node_modules/`
-- `.venv/`
-- `.local/`
-- `dist/`
-- `dist-electron/`
-- `resources/`
-- `__pycache__/`
-- `.env.local`
-
-初始化仓库并首次提交：
-
-```bash
-git init
-git add .
-git commit -m "Initial commit"
-```
-
-连接 GitHub 仓库并推送：
-
-```bash
-git remote add origin https://github.com/<your-name>/aircraft-launch-planning-system.git
-git branch -M main
-git push -u origin main
-```
 
 ## 其他设备使用
 
