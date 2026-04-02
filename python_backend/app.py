@@ -1,16 +1,24 @@
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
-from ga import (
-    DEFAULT_WORKFLOW,
-    GeneticAlgorithm,
-    GreedyAlgorithm,
-    SimulatedAnnealing,
-    Task,
-)
+from ga import DEFAULT_WORKFLOW, GeneticAlgorithm, SimulatedAnnealing, Task
 
 app = Flask(__name__)
 CORS(app)
+
+
+def normalize_uncertainty(task_id, duration, raw_uncertainty):
+    uncertainty = raw_uncertainty if isinstance(raw_uncertainty, dict) else {}
+    enabled = bool(uncertainty.get("enabled", False))
+    mean = float(uncertainty.get("mean", duration))
+    std_dev = float(uncertainty.get("stdDev", 0))
+
+    if mean <= 0:
+        raise ValueError(f"task {task_id} uncertainty mean must be positive")
+    if std_dev < 0:
+        raise ValueError(f"task {task_id} uncertainty stdDev must not be negative")
+
+    return {"enabled": enabled, "mean": mean, "stdDev": std_dev}
 
 
 def normalize_workflow(raw_workflow):
@@ -41,6 +49,7 @@ def normalize_workflow(raw_workflow):
                 "duration": duration,
                 "resources": {str(res): int(amount) for res, amount in resources.items() if int(amount) > 0},
                 "predecessors": [str(predecessor) for predecessor in predecessors],
+                "uncertainty": normalize_uncertainty(task_id, duration, task.get("uncertainty")),
             }
         )
 
@@ -69,14 +78,16 @@ def build_tasks(num_planes, workflow):
 
         for task in workflow:
             predecessors = [plane_map[predecessor] for predecessor in task["predecessors"]]
+            display_duration = round(task["uncertainty"]["mean"]) if task["uncertainty"]["enabled"] else task["duration"]
             tasks[plane_map[task["id"]]] = Task(
                 id=plane_map[task["id"]],
                 plane_id=plane_id,
                 type=task["id"],
                 name=task["name"],
-                duration=task["duration"],
+                duration=max(1, int(display_duration)),
                 resources=task["resources"],
                 predecessors=predecessors,
+                uncertainty=task["uncertainty"],
             )
 
     return tasks, all_ids
@@ -93,6 +104,7 @@ def serialize_tasks(tasks):
             "duration": task.duration,
             "resources": task.resources,
             "predecessors": task.predecessors,
+            "uncertainty": task.uncertainty,
         }
     return serialized
 
@@ -105,6 +117,8 @@ def optimize():
         num_planes = int(data.get("numPlanes", 12))
         pop_size = int(data.get("popSize", 50))
         gens = int(data.get("gens", 100))
+        sample_count = int(data.get("sampleCount", 100))
+        worker_count = int(data.get("workers", 0) or 0)
         resources = data.get("resources", {})
         algorithm = data.get("algorithm", "GA")
         workflow = normalize_workflow(data.get("workflow"))
@@ -115,6 +129,10 @@ def optimize():
             raise ValueError("popSize must be positive")
         if gens <= 0:
             raise ValueError("gens must be positive")
+        if sample_count <= 0:
+            raise ValueError("sampleCount must be positive")
+        if worker_count < 0:
+            raise ValueError("workers must not be negative")
         if not isinstance(resources, dict):
             raise ValueError("resources must be an object")
 
@@ -126,11 +144,11 @@ def optimize():
         tasks, all_ids = build_tasks(num_planes, workflow)
 
         if algorithm == "GA":
-            runner = GeneticAlgorithm(tasks, all_ids, normalized_resources, pop_size, gens)
+            runner = GeneticAlgorithm(tasks, all_ids, normalized_resources, pop_size, gens, sample_count, worker_count or None)
         elif algorithm == "SA":
-            runner = SimulatedAnnealing(tasks, all_ids, normalized_resources, gens)
+            runner = SimulatedAnnealing(tasks, all_ids, normalized_resources, gens, sample_count, worker_count or None)
         else:
-            runner = GreedyAlgorithm(tasks, all_ids, normalized_resources)
+            raise ValueError("algorithm must be GA or SA")
 
         scheduled, makespan, history = runner.run()
     except ValueError as error:
@@ -142,6 +160,8 @@ def optimize():
             "makespan": makespan,
             "history": history,
             "tasks": serialize_tasks(tasks),
+            "sampleCount": sample_count,
+            "workers": worker_count,
         }
     )
 

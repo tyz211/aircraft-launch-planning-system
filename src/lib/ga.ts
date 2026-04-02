@@ -1,11 +1,18 @@
 export type ResourceMap = Record<string, number>;
 
+export interface TaskUncertainty {
+  enabled: boolean;
+  mean: number;
+  stdDev: number;
+}
+
 export interface TaskInfo {
   id: string;
   name: string;
   duration: number;
   resources: ResourceMap;
   predecessors: string[];
+  uncertainty: TaskUncertainty;
 }
 
 export class Task {
@@ -16,8 +23,18 @@ export class Task {
   duration: number;
   resources: ResourceMap;
   predecessors: string[];
+  uncertainty: TaskUncertainty;
 
-  constructor(id: string, plane_id: number, type_code: string, name: string, duration: number, resources: ResourceMap, predecessors: string[]) {
+  constructor(
+    id: string,
+    plane_id: number,
+    type_code: string,
+    name: string,
+    duration: number,
+    resources: ResourceMap,
+    predecessors: string[],
+    uncertainty?: TaskUncertainty,
+  ) {
     this.id = id;
     this.plane_id = plane_id;
     this.type = type_code;
@@ -25,263 +42,300 @@ export class Task {
     this.duration = duration;
     this.resources = resources;
     this.predecessors = predecessors;
+    this.uncertainty = uncertainty ?? { enabled: false, mean: duration, stdDev: 0 };
   }
 }
 
-export function ssgs_decode(priority_list: string[], tasks: Record<string, Task>, res_cap: ResourceMap) {
-  const scheduled: Record<string, [number, number]> = {};
-  const timeline: Record<string, number>[] = Array.from({ length: 2000 }, () => {
-    const obj: Record<string, number> = {};
-    for (const k in res_cap) obj[k] = 0;
-    return obj;
+type DurationMap = Record<string, number>;
+
+function deterministicDuration(task: Task) {
+  if (task.uncertainty?.enabled) {
+    return Math.max(1, Math.round(task.uncertainty.mean));
+  }
+  return Math.max(1, Math.round(task.duration));
+}
+
+function sampleNormal(mean: number, stdDev: number) {
+  if (stdDev === 0) return mean;
+  const u1 = 1 - Math.random();
+  const u2 = 1 - Math.random();
+  const randStdNormal = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+  return mean + stdDev * randStdNormal;
+}
+
+function sampleDuration(task: Task) {
+  if (task.uncertainty?.enabled) {
+    return Math.max(1, Math.round(sampleNormal(task.uncertainty.mean, task.uncertainty.stdDev)));
+  }
+  return deterministicDuration(task);
+}
+
+function buildDurationMap(tasks: Record<string, Task>, resolver: (task: Task) => number) {
+  const durations: DurationMap = {};
+  Object.entries(tasks).forEach(([taskId, task]) => {
+    durations[taskId] = resolver(task);
   });
+  return durations;
+}
 
-  const remaining_tasks = [...priority_list];
+export function ssgs_decode(
+  priority_list: string[],
+  tasks: Record<string, Task>,
+  res_cap: ResourceMap,
+  durations?: DurationMap,
+) {
+  const scheduled: Record<string, [number, number]> = {};
+  const timeline: Record<string, number>[] = [];
+  const priorityPositions = new Map(priority_list.map((taskId, index) => [taskId, index]));
+  const effectiveDurations = durations ?? buildDurationMap(tasks, deterministicDuration);
 
-  while (remaining_tasks.length > 0) {
-    const eligible = remaining_tasks.filter(tid => {
-      const task = tasks[tid];
-      return task.predecessors.every(p => scheduled[p] !== undefined);
-    });
+  const getUsage = (time: number) => {
+    while (timeline.length <= time) {
+      const usage: Record<string, number> = {};
+      for (const resource of Object.keys(res_cap)) usage[resource] = 0;
+      timeline.push(usage);
+    }
+    return timeline[time];
+  };
 
-    let target_tid: string | null = null;
-    for (const tid of priority_list) {
-      if (eligible.includes(tid)) {
-        target_tid = tid;
-        break;
+  const remainingTasks = [...priority_list];
+
+  while (remainingTasks.length > 0) {
+    const eligible = remainingTasks.filter(taskId => tasks[taskId].predecessors.every(pred => scheduled[pred] !== undefined));
+    if (eligible.length === 0) break;
+
+    let targetTaskId = eligible[0];
+    let bestPosition = priorityPositions.get(targetTaskId) ?? Number.MAX_SAFE_INTEGER;
+    for (const taskId of eligible) {
+      const currentPosition = priorityPositions.get(taskId) ?? Number.MAX_SAFE_INTEGER;
+      if (currentPosition < bestPosition) {
+        targetTaskId = taskId;
+        bestPosition = currentPosition;
       }
     }
 
-    if (!target_tid) break;
-
-    remaining_tasks.splice(remaining_tasks.indexOf(target_tid), 1);
-    const task = tasks[target_tid];
+    remainingTasks.splice(remainingTasks.indexOf(targetTaskId), 1);
+    const task = tasks[targetTaskId];
+    const taskDuration = effectiveDurations[targetTaskId];
 
     let est = 0;
     if (task.predecessors.length > 0) {
-      est = Math.max(...task.predecessors.map(p => scheduled[p][1]));
+      est = Math.max(...task.predecessors.map(pred => scheduled[pred][1]));
     }
 
     let start_time = est;
     while (true) {
-      let is_feasible = true;
-      for (let t = start_time; t < start_time + task.duration; t++) {
-        for (const [res, amount] of Object.entries(task.resources)) {
-          if (timeline[t][res] + amount > res_cap[res]) {
-            is_feasible = false;
+      let feasible = true;
+      for (let t = start_time; t < start_time + taskDuration; t++) {
+        const usage = getUsage(t);
+        for (const [resource, amount] of Object.entries(task.resources)) {
+          if ((usage[resource] ?? 0) + amount > (res_cap[resource] ?? 0)) {
+            feasible = false;
             break;
           }
         }
-        if (!is_feasible) break;
+        if (!feasible) break;
       }
-
-      if (is_feasible) break;
-      else start_time++;
+      if (feasible) break;
+      start_time++;
     }
 
-    const end_time = start_time + task.duration;
-    scheduled[target_tid] = [start_time, end_time];
+    const end_time = start_time + taskDuration;
+    scheduled[targetTaskId] = [start_time, end_time];
     for (let t = start_time; t < end_time; t++) {
-      for (const [res, amount] of Object.entries(task.resources)) {
-        timeline[t][res] += amount;
+      const usage = getUsage(t);
+      for (const [resource, amount] of Object.entries(task.resources)) {
+        usage[resource] = (usage[resource] ?? 0) + amount;
       }
     }
   }
 
-  const makespan = Math.max(...Object.values(scheduled).map(v => v[1]));
+  const makespan = Math.max(0, ...Object.values(scheduled).map(value => value[1]));
   return { scheduled, makespan };
+}
+
+class SequenceEvaluator {
+  tasks: Record<string, Task>;
+  res_cap: ResourceMap;
+  sampleCount: number;
+
+  constructor(tasks: Record<string, Task>, res_cap: ResourceMap, sampleCount = 100) {
+    this.tasks = tasks;
+    this.res_cap = res_cap;
+    this.sampleCount = Math.max(1, sampleCount);
+  }
+
+  evaluate(priorityList: string[]) {
+    let totalMakespan = 0;
+    for (let i = 0; i < this.sampleCount; i++) {
+      const durations = buildDurationMap(this.tasks, sampleDuration);
+      totalMakespan += ssgs_decode(priorityList, this.tasks, this.res_cap, durations).makespan;
+    }
+    return Number((totalMakespan / this.sampleCount).toFixed(2));
+  }
+
+  deterministicSchedule(priorityList: string[]) {
+    const durations = buildDurationMap(this.tasks, deterministicDuration);
+    return ssgs_decode(priorityList, this.tasks, this.res_cap, durations);
+  }
 }
 
 export class GeneticAlgorithm {
   tasks: Record<string, Task>;
   all_ids: string[];
-  res_cap: ResourceMap;
   pop_size: number;
   gens: number;
   mutation_rate: number;
+  evaluator: SequenceEvaluator;
 
-  constructor(tasks: Record<string, Task>, all_ids: string[], res_cap: ResourceMap, pop_size = 30, gens = 50) {
+  constructor(tasks: Record<string, Task>, all_ids: string[], res_cap: ResourceMap, pop_size = 30, gens = 50, sampleCount = 100) {
     this.tasks = tasks;
     this.all_ids = all_ids;
-    this.res_cap = res_cap;
     this.pop_size = pop_size;
     this.gens = gens;
     this.mutation_rate = 0.2;
+    this.evaluator = new SequenceEvaluator(tasks, res_cap, sampleCount);
   }
 
   init_population() {
-    const pop: string[][] = [];
+    const population: string[][] = [];
     for (let i = 0; i < this.pop_size; i++) {
-      const chrom = [...this.all_ids];
-      for (let j = chrom.length - 1; j > 0; j--) {
+      const chromosome = [...this.all_ids];
+      for (let j = chromosome.length - 1; j > 0; j--) {
         const k = Math.floor(Math.random() * (j + 1));
-        [chrom[j], chrom[k]] = [chrom[k], chrom[j]];
+        [chromosome[j], chromosome[k]] = [chromosome[k], chromosome[j]];
       }
-      pop.push(chrom);
+      population.push(chromosome);
     }
-    return pop;
+    return population;
   }
 
-  selection(pop: string[][], fitness: number[]) {
-    const idx1 = Math.floor(Math.random() * pop.length);
-    const idx2 = Math.floor(Math.random() * pop.length);
-    return fitness[idx1] > fitness[idx2] ? pop[idx1] : pop[idx2];
+  selection(population: string[][], fitness: number[]) {
+    const idx1 = Math.floor(Math.random() * population.length);
+    const idx2 = Math.floor(Math.random() * population.length);
+    return fitness[idx1] > fitness[idx2] ? population[idx1] : population[idx2];
   }
 
-  crossover(p1: string[], p2: string[]) {
-    const size = p1.length;
+  crossover(parent1: string[], parent2: string[]) {
+    const size = parent1.length;
     let a = Math.floor(Math.random() * size);
     let b = Math.floor(Math.random() * size);
     if (a > b) [a, b] = [b, a];
-    
-    const child = new Array(size).fill(null);
+
+    const child = new Array<string | null>(size).fill(null);
     for (let i = a; i < b; i++) {
-      child[i] = p1[i];
+      child[i] = parent1[i];
     }
-    
-    const p2_fill = p2.filter(item => !child.includes(item));
-    let it = 0;
+
+    const parent2Fill = parent2.filter(item => !child.includes(item));
+    let fillIndex = 0;
     for (let i = 0; i < size; i++) {
       if (child[i] === null) {
-        child[i] = p2_fill[it++];
+        child[i] = parent2Fill[fillIndex++];
       }
     }
-    return child;
+    return child as string[];
   }
 
-  mutate(chrom: string[]) {
+  mutate(chromosome: string[]) {
     if (Math.random() < this.mutation_rate) {
-      const idx1 = Math.floor(Math.random() * chrom.length);
-      const idx2 = Math.floor(Math.random() * chrom.length);
-      [chrom[idx1], chrom[idx2]] = [chrom[idx2], chrom[idx1]];
+      const idx1 = Math.floor(Math.random() * chromosome.length);
+      const idx2 = Math.floor(Math.random() * chromosome.length);
+      [chromosome[idx1], chromosome[idx2]] = [chromosome[idx2], chromosome[idx1]];
     }
-    return chrom;
+    return chromosome;
   }
 
   async run(onProgress: (gen: number, bestMs: number) => void) {
-    let pop = this.init_population();
-    let best_chrom: string[] | null = null;
-    let min_makespan = Infinity;
+    let population = this.init_population();
+    let bestChromosome: string[] | null = null;
+    let minMakespan = Infinity;
     const history: { gen: number; bestMs: number }[] = [];
 
-    for (let g = 0; g < this.gens; g++) {
-      const results = pop.map(ind => ssgs_decode(ind, this.tasks, this.res_cap));
-      const makespans = results.map(r => r.makespan);
-      const fitness = makespans.map(m => 1.0 / m);
+    for (let generation = 0; generation < this.gens; generation++) {
+      const makespans = population.map(individual => this.evaluator.evaluate(individual));
+      const fitness = makespans.map(makespan => 1.0 / makespan);
+      const currentMin = Math.min(...makespans);
 
-      const current_min = Math.min(...makespans);
-      if (current_min < min_makespan) {
-        min_makespan = current_min;
-        best_chrom = [...pop[makespans.indexOf(current_min)]];
+      if (currentMin < minMakespan) {
+        minMakespan = currentMin;
+        bestChromosome = [...population[makespans.indexOf(currentMin)]];
       }
 
-      history.push({ gen: g + 1, bestMs: min_makespan });
+      history.push({ gen: generation + 1, bestMs: Number(minMakespan.toFixed(2)) });
 
-      const new_pop = [best_chrom!];
-      while (new_pop.length < this.pop_size) {
-        const p1 = this.selection(pop, fitness);
-        const p2 = this.selection(pop, fitness);
-        let child = this.crossover(p1, p2);
+      const newPopulation = [bestChromosome!];
+      while (newPopulation.length < this.pop_size) {
+        const parent1 = this.selection(population, fitness);
+        const parent2 = this.selection(population, fitness);
+        let child = this.crossover(parent1, parent2);
         child = this.mutate(child);
-        new_pop.push(child);
+        newPopulation.push(child);
       }
-      pop = new_pop;
+      population = newPopulation;
 
-      if (g % 5 === 0 || g === this.gens - 1) {
-        onProgress(g + 1, min_makespan);
-        // Yield to the event loop so the UI updates
-        await new Promise(r => setTimeout(r, 0));
+      if (generation % 5 === 0 || generation === this.gens - 1) {
+        onProgress(generation + 1, Number(minMakespan.toFixed(2)));
+        await new Promise(resolve => setTimeout(resolve, 0));
       }
     }
 
-    const { scheduled, makespan } = ssgs_decode(best_chrom!, this.tasks, this.res_cap);
-    return { scheduled, makespan, history };
-  }
-}
-
-export class GreedyAlgorithm {
-  tasks: Record<string, Task>;
-  all_ids: string[];
-  res_cap: ResourceMap;
-
-  constructor(tasks: Record<string, Task>, all_ids: string[], res_cap: ResourceMap) {
-    this.tasks = tasks;
-    this.all_ids = all_ids;
-    this.res_cap = res_cap;
-  }
-
-  async run(onProgress: (gen: number, bestMs: number) => void) {
-    // Greedy: sort by plane ID, then task type (F1 to F8) to simulate sequential processing
-    const priority_list = [...this.all_ids].sort((a, b) => {
-      const taskA = this.tasks[a];
-      const taskB = this.tasks[b];
-      if (taskA.plane_id !== taskB.plane_id) return taskA.plane_id - taskB.plane_id;
-      return taskA.type.localeCompare(taskB.type);
-    });
-
-    const { scheduled, makespan } = ssgs_decode(priority_list, this.tasks, this.res_cap);
-    
-    // Simulate a single step for progress
-    onProgress(1, makespan);
-    await new Promise(r => setTimeout(r, 100));
-
-    return { scheduled, makespan, history: [{ gen: 1, bestMs: makespan }] };
+    const { scheduled } = this.evaluator.deterministicSchedule(bestChromosome!);
+    return { scheduled, makespan: Number(minMakespan.toFixed(2)), history };
   }
 }
 
 export class SimulatedAnnealing {
   tasks: Record<string, Task>;
   all_ids: string[];
-  res_cap: ResourceMap;
   gens: number;
+  evaluator: SequenceEvaluator;
 
-  constructor(tasks: Record<string, Task>, all_ids: string[], res_cap: ResourceMap, gens = 100) {
+  constructor(tasks: Record<string, Task>, all_ids: string[], res_cap: ResourceMap, gens = 100, sampleCount = 100) {
     this.tasks = tasks;
     this.all_ids = all_ids;
-    this.res_cap = res_cap;
     this.gens = gens;
+    this.evaluator = new SequenceEvaluator(tasks, res_cap, sampleCount);
   }
 
   async run(onProgress: (gen: number, bestMs: number) => void) {
-    let current_chrom = [...this.all_ids].sort(() => Math.random() - 0.5);
-    let { makespan: current_ms } = ssgs_decode(current_chrom, this.tasks, this.res_cap);
-    
-    let best_chrom = [...current_chrom];
-    let best_ms = current_ms;
-    
-    let temp = 100;
-    const cooling_rate = 0.95;
+    let currentChromosome = [...this.all_ids].sort(() => Math.random() - 0.5);
+    let currentMakespan = this.evaluator.evaluate(currentChromosome);
+
+    let bestChromosome = [...currentChromosome];
+    let bestMakespan = currentMakespan;
+
+    let temperature = 100;
+    const coolingRate = 0.95;
     const history: { gen: number; bestMs: number }[] = [];
 
-    for (let g = 0; g < this.gens; g++) {
-      // Generate neighbor by swapping two random tasks
-      const neighbor = [...current_chrom];
+    for (let generation = 0; generation < this.gens; generation++) {
+      const neighbor = [...currentChromosome];
       const idx1 = Math.floor(Math.random() * neighbor.length);
       const idx2 = Math.floor(Math.random() * neighbor.length);
       [neighbor[idx1], neighbor[idx2]] = [neighbor[idx2], neighbor[idx1]];
 
-      const { makespan: neighbor_ms } = ssgs_decode(neighbor, this.tasks, this.res_cap);
+      const neighborMakespan = this.evaluator.evaluate(neighbor);
 
-      // Acceptance criteria
-      if (neighbor_ms < current_ms || Math.random() < Math.exp((current_ms - neighbor_ms) / temp)) {
-        current_chrom = neighbor;
-        current_ms = neighbor_ms;
-        if (current_ms < best_ms) {
-          best_ms = current_ms;
-          best_chrom = [...current_chrom];
+      if (neighborMakespan < currentMakespan || Math.random() < Math.exp((currentMakespan - neighborMakespan) / temperature)) {
+        currentChromosome = neighbor;
+        currentMakespan = neighborMakespan;
+        if (currentMakespan < bestMakespan) {
+          bestMakespan = currentMakespan;
+          bestChromosome = [...currentChromosome];
         }
       }
-      
-      temp *= cooling_rate;
-      history.push({ gen: g + 1, bestMs: best_ms });
 
-      if (g % 5 === 0 || g === this.gens - 1) {
-        onProgress(g + 1, best_ms);
-        await new Promise(r => setTimeout(r, 0));
+      temperature *= coolingRate;
+      history.push({ gen: generation + 1, bestMs: Number(bestMakespan.toFixed(2)) });
+
+      if (generation % 5 === 0 || generation === this.gens - 1) {
+        onProgress(generation + 1, Number(bestMakespan.toFixed(2)));
+        await new Promise(resolve => setTimeout(resolve, 0));
       }
     }
 
-    const { scheduled, makespan } = ssgs_decode(best_chrom, this.tasks, this.res_cap);
-    return { scheduled, makespan, history };
+    const { scheduled } = this.evaluator.deterministicSchedule(bestChromosome);
+    return { scheduled, makespan: Number(bestMakespan.toFixed(2)), history };
   }
 }

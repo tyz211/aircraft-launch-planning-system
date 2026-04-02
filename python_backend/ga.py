@@ -1,4 +1,6 @@
+from concurrent.futures import ProcessPoolExecutor
 import math
+from multiprocessing import cpu_count
 import random
 
 
@@ -9,6 +11,7 @@ DEFAULT_WORKFLOW = [
         "duration": 2,
         "resources": {"机务人员": 2},
         "predecessors": [],
+        "uncertainty": {"enabled": False, "mean": 2, "stdDev": 0.5},
     },
     {
         "id": "F2",
@@ -16,6 +19,7 @@ DEFAULT_WORKFLOW = [
         "duration": 4,
         "resources": {"加油车": 1, "机务人员": 1},
         "predecessors": ["F1"],
+        "uncertainty": {"enabled": False, "mean": 4, "stdDev": 0.8},
     },
     {
         "id": "F3",
@@ -23,6 +27,7 @@ DEFAULT_WORKFLOW = [
         "duration": 2,
         "resources": {"挂弹车": 1, "军械人员": 2},
         "predecessors": ["F1"],
+        "uncertainty": {"enabled": False, "mean": 2, "stdDev": 0.5},
     },
     {
         "id": "F4",
@@ -30,6 +35,7 @@ DEFAULT_WORKFLOW = [
         "duration": 2,
         "resources": {"航电人员": 1, "测试仪": 1},
         "predecessors": ["F1"],
+        "uncertainty": {"enabled": False, "mean": 2, "stdDev": 0.5},
     },
     {
         "id": "F5",
@@ -37,6 +43,7 @@ DEFAULT_WORKFLOW = [
         "duration": 3,
         "resources": {"机务人员": 1, "航电人员": 1},
         "predecessors": ["F2", "F3", "F4"],
+        "uncertainty": {"enabled": False, "mean": 3, "stdDev": 0.6},
     },
     {
         "id": "F6",
@@ -44,6 +51,7 @@ DEFAULT_WORKFLOW = [
         "duration": 1,
         "resources": {"特设人员": 1},
         "predecessors": ["F5"],
+        "uncertainty": {"enabled": False, "mean": 1, "stdDev": 0.3},
     },
     {
         "id": "F7",
@@ -51,6 +59,7 @@ DEFAULT_WORKFLOW = [
         "duration": 2,
         "resources": {"机务人员": 2},
         "predecessors": ["F6"],
+        "uncertainty": {"enabled": False, "mean": 2, "stdDev": 0.5},
     },
     {
         "id": "F8",
@@ -58,12 +67,13 @@ DEFAULT_WORKFLOW = [
         "duration": 1,
         "resources": {},
         "predecessors": ["F7"],
+        "uncertainty": {"enabled": False, "mean": 1, "stdDev": 0.2},
     },
 ]
 
 
 class Task:
-    def __init__(self, id, plane_id, type, name, duration, resources, predecessors):
+    def __init__(self, id, plane_id, type, name, duration, resources, predecessors, uncertainty=None):
         self.id = id
         self.plane_id = plane_id
         self.type = type
@@ -71,13 +81,54 @@ class Task:
         self.duration = duration
         self.resources = resources
         self.predecessors = predecessors
+        self.uncertainty = uncertainty or {"enabled": False, "mean": duration, "stdDev": 0}
 
 
-def ssgs_decode(priority_list, tasks, res_cap):
+def resolve_deterministic_duration(task):
+    uncertainty = task.uncertainty or {}
+    if uncertainty.get("enabled"):
+        return max(1, int(round(float(uncertainty.get("mean", task.duration)))))
+    return max(1, int(round(task.duration)))
+
+
+def sample_duration(task):
+    uncertainty = task.uncertainty or {}
+    if uncertainty.get("enabled"):
+        sampled = random.gauss(float(uncertainty.get("mean", task.duration)), float(uncertainty.get("stdDev", 0)))
+        return max(1, int(round(sampled)))
+    return resolve_deterministic_duration(task)
+
+
+def sample_duration_with_rng(task, rng):
+    uncertainty = task.uncertainty or {}
+    if uncertainty.get("enabled"):
+        sampled = rng.gauss(float(uncertainty.get("mean", task.duration)), float(uncertainty.get("stdDev", 0)))
+        return max(1, int(round(sampled)))
+    return resolve_deterministic_duration(task)
+
+
+def build_duration_map(tasks, sampler):
+    return {task_id: sampler(task) for task_id, task in tasks.items()}
+
+
+def build_sampled_duration_map(tasks, seed):
+    rng = random.Random(seed)
+    return {task_id: sample_duration_with_rng(task, rng) for task_id, task in tasks.items()}
+
+
+def default_worker_count():
+    try:
+        return max(1, min(8, cpu_count() - 1))
+    except NotImplementedError:
+        return 1
+
+
+def ssgs_decode(priority_list, tasks, res_cap, durations=None):
     scheduled = {}
     completed = set()
     res_usage = []
     priority_positions = {tid: idx for idx, tid in enumerate(priority_list)}
+    effective_durations = durations or build_duration_map(tasks, resolve_deterministic_duration)
 
     def get_usage(t):
         while len(res_usage) <= t:
@@ -90,6 +141,7 @@ def ssgs_decode(priority_list, tasks, res_cap):
         curr_tid = min(eligible, key=lambda tid: priority_positions.get(tid, float("inf")))
         eligible.remove(curr_tid)
         task = tasks[curr_tid]
+        task_duration = effective_durations[curr_tid]
 
         est = 0
         for predecessor in task.predecessors:
@@ -99,7 +151,7 @@ def ssgs_decode(priority_list, tasks, res_cap):
         start_time = est
         while True:
             can_schedule = True
-            for t in range(start_time, start_time + task.duration):
+            for t in range(start_time, start_time + task_duration):
                 usage = get_usage(t)
                 for res, amt in task.resources.items():
                     if usage.get(res, 0) + amt > res_cap.get(res, 0):
@@ -111,12 +163,12 @@ def ssgs_decode(priority_list, tasks, res_cap):
                 break
             start_time += 1
 
-        for t in range(start_time, start_time + task.duration):
+        for t in range(start_time, start_time + task_duration):
             usage = get_usage(t)
             for res, amt in task.resources.items():
                 usage[res] = usage.get(res, 0) + amt
 
-        scheduled[curr_tid] = [start_time, start_time + task.duration]
+        scheduled[curr_tid] = [start_time, start_time + task_duration]
         completed.add(curr_tid)
 
         for tid, task_obj in tasks.items():
@@ -128,13 +180,49 @@ def ssgs_decode(priority_list, tasks, res_cap):
     return scheduled, makespan
 
 
+class SequenceEvaluator:
+    def __init__(self, tasks, res_cap, sample_count=100, worker_count=None):
+        self.tasks = tasks
+        self.res_cap = res_cap
+        self.sample_count = max(1, sample_count)
+        self.worker_count = max(1, worker_count or default_worker_count())
+
+    def evaluate(self, priority_list):
+        sampled_makespans = []
+        for _ in range(self.sample_count):
+            sampled_durations = build_duration_map(self.tasks, sample_duration)
+            _, makespan = ssgs_decode(priority_list, self.tasks, self.res_cap, sampled_durations)
+            sampled_makespans.append(makespan)
+        return sum(sampled_makespans) / len(sampled_makespans)
+
+    def evaluate_parallel_samples(self, priority_list):
+        if self.worker_count <= 1 or self.sample_count <= 1:
+            return self.evaluate(priority_list)
+
+        seed_base = random.randrange(1_000_000_000)
+        jobs = [
+            (priority_list, self.tasks, self.res_cap, seed_base + sample_idx)
+            for sample_idx in range(self.sample_count)
+        ]
+        with ProcessPoolExecutor(max_workers=min(self.worker_count, self.sample_count)) as executor:
+            sampled_makespans = list(executor.map(run_single_sample, jobs))
+        return sum(sampled_makespans) / len(sampled_makespans)
+
+    def deterministic_schedule(self, priority_list):
+        durations = build_duration_map(self.tasks, resolve_deterministic_duration)
+        return ssgs_decode(priority_list, self.tasks, self.res_cap, durations)
+
+
 class GeneticAlgorithm:
-    def __init__(self, tasks, all_ids, res_cap, pop_size=50, gens=100):
+    def __init__(self, tasks, all_ids, res_cap, pop_size=50, gens=100, sample_count=100, worker_count=None):
         self.tasks = tasks
         self.all_ids = all_ids
         self.res_cap = res_cap
         self.pop_size = pop_size
         self.gens = gens
+        self.sample_count = max(1, sample_count)
+        self.worker_count = max(1, worker_count or default_worker_count())
+        self.evaluator = SequenceEvaluator(tasks, res_cap, sample_count, self.worker_count)
 
     def init_population(self):
         population = []
@@ -177,8 +265,16 @@ class GeneticAlgorithm:
         history = []
 
         for generation in range(self.gens):
-            results = [ssgs_decode(individual, self.tasks, self.res_cap) for individual in population]
-            makespans = [result[1] for result in results]
+            if self.worker_count > 1 and len(population) > 1:
+                seed_base = random.randrange(1_000_000_000)
+                jobs = [
+                    (individual, self.tasks, self.res_cap, self.sample_count, seed_base + index * self.sample_count)
+                    for index, individual in enumerate(population)
+                ]
+                with ProcessPoolExecutor(max_workers=min(self.worker_count, len(population))) as executor:
+                    makespans = list(executor.map(run_sequence_samples, jobs))
+            else:
+                makespans = [self.evaluator.evaluate(individual) for individual in population]
             fitness = [1.0 / makespan if makespan > 0 else 0 for makespan in makespans]
 
             current_min = min(makespans)
@@ -186,7 +282,7 @@ class GeneticAlgorithm:
                 min_makespan = current_min
                 best_chromosome = list(population[makespans.index(current_min)])
 
-            history.append({"gen": generation + 1, "bestMs": min_makespan})
+            history.append({"gen": generation + 1, "bestMs": round(min_makespan, 2)})
 
             new_population = [list(best_chromosome)]
             while len(new_population) < self.pop_size:
@@ -197,21 +293,22 @@ class GeneticAlgorithm:
                 new_population.append(child)
             population = new_population
 
-        scheduled, makespan = ssgs_decode(best_chromosome, self.tasks, self.res_cap)
-        return scheduled, makespan, history
+        scheduled, _ = self.evaluator.deterministic_schedule(best_chromosome)
+        return scheduled, round(min_makespan, 2), history
 
 
 class SimulatedAnnealing:
-    def __init__(self, tasks, all_ids, res_cap, gens=100):
+    def __init__(self, tasks, all_ids, res_cap, gens=100, sample_count=100, worker_count=None):
         self.tasks = tasks
         self.all_ids = all_ids
         self.res_cap = res_cap
         self.gens = gens
+        self.evaluator = SequenceEvaluator(tasks, res_cap, sample_count, worker_count)
 
     def run(self):
         current_chromosome = list(self.all_ids)
         random.shuffle(current_chromosome)
-        _, current_makespan = ssgs_decode(current_chromosome, self.tasks, self.res_cap)
+        current_makespan = self.evaluator.evaluate_parallel_samples(current_chromosome)
 
         best_chromosome = list(current_chromosome)
         best_makespan = current_makespan
@@ -225,7 +322,7 @@ class SimulatedAnnealing:
             idx2 = random.randint(0, len(neighbor) - 1)
             neighbor[idx1], neighbor[idx2] = neighbor[idx2], neighbor[idx1]
 
-            _, neighbor_makespan = ssgs_decode(neighbor, self.tasks, self.res_cap)
+            neighbor_makespan = self.evaluator.evaluate_parallel_samples(neighbor)
 
             if neighbor_makespan < current_makespan:
                 accept_neighbor = True
@@ -241,19 +338,24 @@ class SimulatedAnnealing:
                     best_chromosome = list(current_chromosome)
 
             temperature *= cooling_rate
-            history.append({"gen": generation + 1, "bestMs": best_makespan})
+            history.append({"gen": generation + 1, "bestMs": round(best_makespan, 2)})
 
-        scheduled, makespan = ssgs_decode(best_chromosome, self.tasks, self.res_cap)
-        return scheduled, makespan, history
+        scheduled, _ = self.evaluator.deterministic_schedule(best_chromosome)
+        return scheduled, round(best_makespan, 2), history
 
 
-class GreedyAlgorithm:
-    def __init__(self, tasks, all_ids, res_cap):
-        self.tasks = tasks
-        self.all_ids = all_ids
-        self.res_cap = res_cap
+def run_single_sample(job):
+    priority_list, tasks, res_cap, seed = job
+    sampled_durations = build_sampled_duration_map(tasks, seed)
+    _, makespan = ssgs_decode(priority_list, tasks, res_cap, sampled_durations)
+    return makespan
 
-    def run(self):
-        priority_list = sorted(self.all_ids, key=lambda tid: (self.tasks[tid].plane_id, self.tasks[tid].type))
-        scheduled, makespan = ssgs_decode(priority_list, self.tasks, self.res_cap)
-        return scheduled, makespan, [{"gen": 1, "bestMs": makespan}]
+
+def run_sequence_samples(job):
+    priority_list, tasks, res_cap, sample_count, seed_base = job
+    sampled_makespans = []
+    for offset in range(sample_count):
+        sampled_durations = build_sampled_duration_map(tasks, seed_base + offset)
+        _, makespan = ssgs_decode(priority_list, tasks, res_cap, sampled_durations)
+        sampled_makespans.append(makespan)
+    return sum(sampled_makespans) / len(sampled_makespans)

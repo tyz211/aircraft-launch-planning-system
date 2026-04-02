@@ -11,6 +11,7 @@ dist-electron/
 resources/
 coverage/
 .DS_Store
+.idea/
 *.log
 .env*
 !.env.example

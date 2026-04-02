@@ -1,6 +1,6 @@
 # Aircraft Launch Planning System
 
-飞机放飞规划管理系统，一个基于 React、Electron 和 Python 的排程优化项目。前端负责流程编排、资源配置和结果展示，后端负责执行遗传算法、模拟退火和贪心调度。
+飞机放飞规划管理系统，一个基于 React、Electron 和 Python 的排程优化项目。前端负责流程编排、资源配置和结果展示，后端负责执行遗传算法和模拟退火调度。
 
 ## 项目结构
 
