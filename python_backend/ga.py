@@ -8,58 +8,58 @@ DEFAULT_WORKFLOW = [
     {
         "id": "F1",
         "name": "接收检查",
-        "duration": 2,
+        "duration": 3,
         "resources": {"机务人员": 2},
         "predecessors": [],
-        "uncertainty": {"enabled": False, "mean": 2, "stdDev": 0.5},
+        "uncertainty": {"enabled": False, "mean": 3, "stdDev": 0.5},
     },
     {
         "id": "F2",
         "name": "燃油加注",
-        "duration": 4,
+        "duration": 6,
         "resources": {"加油车": 1, "机务人员": 1},
         "predecessors": ["F1"],
-        "uncertainty": {"enabled": False, "mean": 4, "stdDev": 0.8},
+        "uncertainty": {"enabled": False, "mean": 6.3, "stdDev": 1.0},
     },
     {
         "id": "F3",
         "name": "挂弹作业",
-        "duration": 2,
+        "duration": 5,
         "resources": {"挂弹车": 1, "军械人员": 2},
         "predecessors": ["F1"],
-        "uncertainty": {"enabled": False, "mean": 2, "stdDev": 0.5},
+        "uncertainty": {"enabled": False, "mean": 5, "stdDev": 0.6},
     },
     {
         "id": "F4",
         "name": "航电检查",
-        "duration": 2,
+        "duration": 4,
         "resources": {"航电人员": 1, "测试仪": 1},
         "predecessors": ["F1"],
-        "uncertainty": {"enabled": False, "mean": 2, "stdDev": 0.5},
+        "uncertainty": {"enabled": False, "mean": 4.2, "stdDev": 0.8},
     },
     {
         "id": "F5",
         "name": "综合测试",
-        "duration": 3,
-        "resources": {"机务人员": 1, "航电人员": 1},
+        "duration": 5,
+        "resources": {"机务人员": 1, "航电人员": 1, "测试仪": 1},
         "predecessors": ["F2", "F3", "F4"],
-        "uncertainty": {"enabled": False, "mean": 3, "stdDev": 0.6},
+        "uncertainty": {"enabled": False, "mean": 5.5, "stdDev": 1.0},
     },
     {
         "id": "F6",
         "name": "最终确认",
-        "duration": 1,
+        "duration": 2,
         "resources": {"特设人员": 1},
         "predecessors": ["F5"],
-        "uncertainty": {"enabled": False, "mean": 1, "stdDev": 0.3},
+        "uncertainty": {"enabled": False, "mean": 2, "stdDev": 0.4},
     },
     {
         "id": "F7",
         "name": "发动机试车",
-        "duration": 2,
-        "resources": {"机务人员": 2},
+        "duration": 4,
+        "resources": {"机务人员": 2, "测试仪": 1},
         "predecessors": ["F6"],
-        "uncertainty": {"enabled": False, "mean": 2, "stdDev": 0.5},
+        "uncertainty": {"enabled": False, "mean": 4.4, "stdDev": 0.9},
     },
     {
         "id": "F8",
@@ -123,19 +123,59 @@ def default_worker_count():
         return 1
 
 
-def ssgs_decode(priority_list, tasks, res_cap, durations=None):
-    scheduled = {}
-    completed = set()
-    res_usage = []
+def resolve_worker_count(worker_count):
+    if worker_count is None:
+        return default_worker_count()
+    return max(1, int(worker_count))
+
+
+def ssgs_decode(priority_list, tasks, res_cap, durations=None, fixed_schedule=None, release_times=None):
+    scheduled = {task_id: [int(window[0]), int(window[1])] for task_id, window in (fixed_schedule or {}).items()}
     priority_positions = {tid: idx for idx, tid in enumerate(priority_list)}
     effective_durations = durations or build_duration_map(tasks, resolve_deterministic_duration)
+    effective_release_times = {
+        task_id: max(0, int(round(time)))
+        for task_id, time in (release_times or {}).items()
+    }
+    resource_keys = set(res_cap.keys())
+    successors = {task_id: [] for task_id in tasks}
+    remaining_pred_count = {}
+    eligible = []
+    res_usage = {}
 
-    def get_usage(t):
-        while len(res_usage) <= t:
-            res_usage.append({k: 0 for k in res_cap})
-        return res_usage[t]
+    for task_id, task in tasks.items():
+        resource_keys.update(task.resources.keys())
+        for predecessor in task.predecessors:
+            if predecessor in successors:
+                successors[predecessor].append(task_id)
 
-    eligible = [tid for tid, task in tasks.items() if not task.predecessors]
+    for resource in resource_keys:
+        res_usage[resource] = []
+
+    def ensure_usage(resource, end_exclusive):
+        usage = res_usage.setdefault(resource, [])
+        if len(usage) < end_exclusive:
+            usage.extend([0] * (end_exclusive - len(usage)))
+        return usage
+
+    def reserve_resources(task, start_time, end_time):
+        for resource, amount in task.resources.items():
+            usage = ensure_usage(resource, end_time)
+            for time in range(start_time, end_time):
+                usage[time] += amount
+
+    for task_id, (start_time, end_time) in scheduled.items():
+        task = tasks.get(task_id)
+        if task is not None:
+            reserve_resources(task, start_time, end_time)
+
+    for task_id, task in tasks.items():
+        if task_id in scheduled:
+            continue
+        pending_count = sum(1 for predecessor in task.predecessors if predecessor not in scheduled)
+        remaining_pred_count[task_id] = pending_count
+        if pending_count == 0:
+            eligible.append(task_id)
 
     while eligible:
         curr_tid = min(eligible, key=lambda tid: priority_positions.get(tid, float("inf")))
@@ -143,86 +183,132 @@ def ssgs_decode(priority_list, tasks, res_cap, durations=None):
         task = tasks[curr_tid]
         task_duration = effective_durations[curr_tid]
 
-        est = 0
+        if any(amount > res_cap.get(resource, 0) for resource, amount in task.resources.items()):
+            break
+
+        est = effective_release_times.get(curr_tid, 0)
         for predecessor in task.predecessors:
             if predecessor in scheduled:
                 est = max(est, scheduled[predecessor][1])
 
         start_time = est
         while True:
-            can_schedule = True
-            for t in range(start_time, start_time + task_duration):
-                usage = get_usage(t)
-                for res, amt in task.resources.items():
-                    if usage.get(res, 0) + amt > res_cap.get(res, 0):
-                        can_schedule = False
+            next_start = start_time
+            end_time = start_time + task_duration
+
+            for resource, amount in task.resources.items():
+                usage = ensure_usage(resource, end_time)
+                capacity = res_cap.get(resource, 0)
+
+                for time in range(start_time, end_time):
+                    if usage[time] + amount > capacity:
+                        block_end = time + 1
+                        while block_end < len(usage) and usage[block_end] + amount > capacity:
+                            block_end += 1
+                        next_start = max(next_start, block_end)
                         break
-                if not can_schedule:
-                    break
-            if can_schedule:
+
+            if next_start == start_time:
                 break
-            start_time += 1
+            start_time = next_start
 
-        for t in range(start_time, start_time + task_duration):
-            usage = get_usage(t)
-            for res, amt in task.resources.items():
-                usage[res] = usage.get(res, 0) + amt
+        end_time = start_time + task_duration
+        scheduled[curr_tid] = [start_time, end_time]
+        reserve_resources(task, start_time, end_time)
 
-        scheduled[curr_tid] = [start_time, start_time + task_duration]
-        completed.add(curr_tid)
-
-        for tid, task_obj in tasks.items():
-            if tid not in completed and tid not in eligible:
-                if all(pred in completed for pred in task_obj.predecessors):
-                    eligible.append(tid)
+        for successor in successors.get(curr_tid, []):
+            if successor in scheduled:
+                continue
+            remaining_pred_count[successor] -= 1
+            if remaining_pred_count[successor] == 0:
+                eligible.append(successor)
 
     makespan = max((end for _, end in scheduled.values()), default=0)
     return scheduled, makespan
 
 
 class SequenceEvaluator:
-    def __init__(self, tasks, res_cap, sample_count=100, worker_count=None):
+    def __init__(self, tasks, res_cap, sample_count=100, worker_count=None, fixed_schedule=None, release_times=None):
         self.tasks = tasks
         self.res_cap = res_cap
         self.sample_count = max(1, sample_count)
-        self.worker_count = max(1, worker_count or default_worker_count())
+        self.worker_count = resolve_worker_count(worker_count)
+        self.fixed_schedule = fixed_schedule or {}
+        self.release_times = release_times or {}
+        self.deterministic_only = all(
+            (not task.uncertainty.get("enabled")) or float(task.uncertainty.get("stdDev", 0)) == 0
+            for task in tasks.values()
+        )
 
     def evaluate(self, priority_list):
+        if self.sample_count == 1 or self.deterministic_only:
+            _, makespan = self.deterministic_schedule(priority_list)
+            return makespan
         sampled_makespans = []
         for _ in range(self.sample_count):
             sampled_durations = build_duration_map(self.tasks, sample_duration)
-            _, makespan = ssgs_decode(priority_list, self.tasks, self.res_cap, sampled_durations)
+            _, makespan = ssgs_decode(
+                priority_list,
+                self.tasks,
+                self.res_cap,
+                sampled_durations,
+                self.fixed_schedule,
+                self.release_times,
+            )
             sampled_makespans.append(makespan)
         return sum(sampled_makespans) / len(sampled_makespans)
 
     def evaluate_parallel_samples(self, priority_list):
-        if self.worker_count <= 1 or self.sample_count <= 1:
+        if self.worker_count <= 1 or self.sample_count <= 1 or self.deterministic_only:
             return self.evaluate(priority_list)
 
         seed_base = random.randrange(1_000_000_000)
         jobs = [
-            (priority_list, self.tasks, self.res_cap, seed_base + sample_idx)
+            (priority_list, self.tasks, self.res_cap, seed_base + sample_idx, self.fixed_schedule, self.release_times)
             for sample_idx in range(self.sample_count)
         ]
-        with ProcessPoolExecutor(max_workers=min(self.worker_count, self.sample_count)) as executor:
-            sampled_makespans = list(executor.map(run_single_sample, jobs))
-        return sum(sampled_makespans) / len(sampled_makespans)
+        try:
+            with ProcessPoolExecutor(max_workers=min(self.worker_count, self.sample_count)) as executor:
+                sampled_makespans = list(executor.map(run_single_sample, jobs))
+            return sum(sampled_makespans) / len(sampled_makespans)
+        except Exception:
+            return self.evaluate(priority_list)
 
     def deterministic_schedule(self, priority_list):
         durations = build_duration_map(self.tasks, resolve_deterministic_duration)
-        return ssgs_decode(priority_list, self.tasks, self.res_cap, durations)
+        return ssgs_decode(priority_list, self.tasks, self.res_cap, durations, self.fixed_schedule, self.release_times)
 
 
 class GeneticAlgorithm:
-    def __init__(self, tasks, all_ids, res_cap, pop_size=50, gens=100, sample_count=100, worker_count=None):
+    def __init__(
+        self,
+        tasks,
+        all_ids,
+        res_cap,
+        pop_size=50,
+        gens=100,
+        sample_count=100,
+        worker_count=None,
+        fixed_schedule=None,
+        release_times=None,
+    ):
         self.tasks = tasks
         self.all_ids = all_ids
         self.res_cap = res_cap
         self.pop_size = pop_size
         self.gens = gens
         self.sample_count = max(1, sample_count)
-        self.worker_count = max(1, worker_count or default_worker_count())
-        self.evaluator = SequenceEvaluator(tasks, res_cap, sample_count, self.worker_count)
+        self.worker_count = resolve_worker_count(worker_count)
+        self.fixed_schedule = fixed_schedule or {}
+        self.release_times = release_times or {}
+        self.evaluator = SequenceEvaluator(
+            tasks,
+            res_cap,
+            sample_count,
+            self.worker_count,
+            self.fixed_schedule,
+            self.release_times,
+        )
 
     def init_population(self):
         population = []
@@ -268,11 +354,22 @@ class GeneticAlgorithm:
             if self.worker_count > 1 and len(population) > 1:
                 seed_base = random.randrange(1_000_000_000)
                 jobs = [
-                    (individual, self.tasks, self.res_cap, self.sample_count, seed_base + index * self.sample_count)
+                    (
+                        individual,
+                        self.tasks,
+                        self.res_cap,
+                        self.sample_count,
+                        seed_base + index * self.sample_count,
+                        self.fixed_schedule,
+                        self.release_times,
+                    )
                     for index, individual in enumerate(population)
                 ]
-                with ProcessPoolExecutor(max_workers=min(self.worker_count, len(population))) as executor:
-                    makespans = list(executor.map(run_sequence_samples, jobs))
+                try:
+                    with ProcessPoolExecutor(max_workers=min(self.worker_count, len(population))) as executor:
+                        makespans = list(executor.map(run_sequence_samples, jobs))
+                except Exception:
+                    makespans = [self.evaluator.evaluate(individual) for individual in population]
             else:
                 makespans = [self.evaluator.evaluate(individual) for individual in population]
             fitness = [1.0 / makespan if makespan > 0 else 0 for makespan in makespans]
@@ -298,12 +395,29 @@ class GeneticAlgorithm:
 
 
 class SimulatedAnnealing:
-    def __init__(self, tasks, all_ids, res_cap, gens=100, sample_count=100, worker_count=None):
+    def __init__(
+        self,
+        tasks,
+        all_ids,
+        res_cap,
+        gens=100,
+        sample_count=100,
+        worker_count=None,
+        fixed_schedule=None,
+        release_times=None,
+    ):
         self.tasks = tasks
         self.all_ids = all_ids
         self.res_cap = res_cap
         self.gens = gens
-        self.evaluator = SequenceEvaluator(tasks, res_cap, sample_count, worker_count)
+        self.evaluator = SequenceEvaluator(
+            tasks,
+            res_cap,
+            sample_count,
+            worker_count,
+            fixed_schedule or {},
+            release_times or {},
+        )
 
     def run(self):
         current_chromosome = list(self.all_ids)
@@ -345,17 +459,17 @@ class SimulatedAnnealing:
 
 
 def run_single_sample(job):
-    priority_list, tasks, res_cap, seed = job
+    priority_list, tasks, res_cap, seed, fixed_schedule, release_times = job
     sampled_durations = build_sampled_duration_map(tasks, seed)
-    _, makespan = ssgs_decode(priority_list, tasks, res_cap, sampled_durations)
+    _, makespan = ssgs_decode(priority_list, tasks, res_cap, sampled_durations, fixed_schedule, release_times)
     return makespan
 
 
 def run_sequence_samples(job):
-    priority_list, tasks, res_cap, sample_count, seed_base = job
+    priority_list, tasks, res_cap, sample_count, seed_base, fixed_schedule, release_times = job
     sampled_makespans = []
     for offset in range(sample_count):
         sampled_durations = build_sampled_duration_map(tasks, seed_base + offset)
-        _, makespan = ssgs_decode(priority_list, tasks, res_cap, sampled_durations)
+        _, makespan = ssgs_decode(priority_list, tasks, res_cap, sampled_durations, fixed_schedule, release_times)
         sampled_makespans.append(makespan)
     return sum(sampled_makespans) / len(sampled_makespans)

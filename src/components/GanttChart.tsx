@@ -5,7 +5,8 @@ interface GanttChartProps {
   scheduled: Record<string, [number, number]>;
   tasks: Record<string, Task>;
   makespan: number;
-  numPlanes: number;
+  replacementPlaneIds?: number[];
+  failureTaskIds?: string[];
 }
 
 const COLORS = [
@@ -15,10 +16,15 @@ const COLORS = [
   '#c49c94', '#f7b6d2', '#c7c7c7', '#dbdb8d', '#9edae5'
 ];
 
-export const GanttChart: React.FC<GanttChartProps> = ({ scheduled, tasks, makespan, numPlanes }) => {
+export const GanttChart: React.FC<GanttChartProps> = ({ scheduled, tasks, makespan, replacementPlaneIds = [], failureTaskIds = [] }) => {
   const ROW_HEIGHT = 60;
   const HEADER_HEIGHT = 40;
-  const chartHeight = numPlanes * ROW_HEIGHT + HEADER_HEIGHT;
+  const taskList = Object.values(tasks) as Task[];
+  const planeIds = Array.from(new Set(taskList.map(task => task.plane_id))).sort((left, right) => left - right);
+  const planeIndexMap = new Map(planeIds.map((planeId, index) => [planeId, index]));
+  const chartHeight = planeIds.length * ROW_HEIGHT + HEADER_HEIGHT;
+  const replacementPlaneSet = new Set(replacementPlaneIds);
+  const failureTaskSet = new Set(failureTaskIds);
 
   const ticks = [];
   for (let i = 0; i <= makespan; i += Math.ceil(makespan / 20)) {
@@ -45,14 +51,14 @@ export const GanttChart: React.FC<GanttChartProps> = ({ scheduled, tasks, makesp
         </div>
 
         {/* Y-axis labels and grid lines */}
-        {Array.from({ length: numPlanes }).map((_, i) => (
+        {planeIds.map((planeId, index) => (
           <div
-            key={i}
+            key={planeId}
             className="absolute left-0 right-0 border-b border-slate-100 flex items-center"
-            style={{ top: HEADER_HEIGHT + i * ROW_HEIGHT, height: ROW_HEIGHT }}
+            style={{ top: HEADER_HEIGHT + index * ROW_HEIGHT, height: ROW_HEIGHT }}
           >
             <div className="w-12 text-sm font-medium text-slate-600 text-center">
-              A{i + 1}
+              {replacementPlaneSet.has(planeId) ? `A${planeId}*` : `A${planeId}`}
             </div>
             <div className="flex-1 h-full relative border-l border-slate-200">
               {/* Grid lines */}
@@ -72,7 +78,7 @@ export const GanttChart: React.FC<GanttChartProps> = ({ scheduled, tasks, makesp
           {Object.keys(scheduled).map(tid => {
             const [start, end] = scheduled[tid];
             const task = tasks[tid];
-            const planeIdx = task.plane_id - 1;
+            const planeIdx = planeIndexMap.get(task.plane_id) ?? 0;
             const color = COLORS[planeIdx % COLORS.length];
             
             let top = planeIdx * ROW_HEIGHT + 10;
@@ -102,7 +108,9 @@ export const GanttChart: React.FC<GanttChartProps> = ({ scheduled, tasks, makesp
                   left: `${left}%`,
                   width: `${width}%`,
                   backgroundColor: color,
-                  fontSize
+                  fontSize,
+                  outline: failureTaskSet.has(tid) ? '2px solid #dc2626' : undefined,
+                  outlineOffset: failureTaskSet.has(tid) ? '1px' : undefined,
                 }}
               >
                 {task.type}
